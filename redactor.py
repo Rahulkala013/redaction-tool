@@ -16,6 +16,7 @@ except OSError:
 
 # Dictionary to maintain consistent fake replacements across the document
 replacement_map = {}
+redact_cache = {}
 
 # --- REGEX PATTERNS ---
 PATTERNS = {
@@ -61,6 +62,11 @@ def get_fake_value(entity_text, entity_type):
 
 def redact_text(text):
     """Processes text to detect and replace PII with fake data."""
+    if not text.strip():
+        return text
+    if text in redact_cache:
+        return redact_cache[text]
+
     redacted_text = text
 
     # 1. Regex-based Redaction
@@ -75,20 +81,25 @@ def redact_text(text):
             fake_val = get_fake_value(original, label)
             redacted_text = redacted_text[:match.start()] + fake_val + redacted_text[match.end():]
 
-    # 2. NER-based Redaction 
-    doc = nlp(redacted_text)
-    # NOTE: Using doc.ents here to fix the previous token issue!
-    pii_entities = [ent for ent in doc.ents if ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]]
-    pii_entities = sorted(pii_entities, key=lambda x: x.start_char, reverse=True)
-    
-    for ent in pii_entities:
-        fake_val = get_fake_value(ent.text, ent.label_)
-        redacted_text = redacted_text[:ent.start_char] + fake_val + redacted_text[ent.end_char:]
+    # 2. NER-based Redaction
+    # Skip running heavy spaCy NER if the text doesn't contain any letters (names/orgs require alphabetic characters)
+    if re.search(r'[a-zA-Z]', redacted_text):
+        doc = nlp(redacted_text, disable=["tagger", "parser", "attribute_ruler", "lemmatizer"])
+        # NOTE: Using doc.ents here to fix the previous token issue!
+        pii_entities = [ent for ent in doc.ents if ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]]
+        pii_entities = sorted(pii_entities, key=lambda x: x.start_char, reverse=True)
+        
+        for ent in pii_entities:
+            fake_val = get_fake_value(ent.text, ent.label_)
+            redacted_text = redacted_text[:ent.start_char] + fake_val + redacted_text[ent.end_char:]
 
+    redact_cache[text] = redacted_text
     return redacted_text
 
 def redact_document_stream(stream):
     """Reads a docx stream, redacts it in memory, and returns a BytesIO stream with the redacted document."""
+    replacement_map.clear()
+    redact_cache.clear()
     try:
         doc = Document(stream)
     except Exception as e:
@@ -100,10 +111,14 @@ def redact_document_stream(stream):
         if para.text.strip():
             para.text = redact_text(para.text)
 
-    # Process tables (very common in Prospectus documents)
+    # Process tables (deduplicate merged cells to optimize speed)
+    processed_cells = set()
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
+                if cell._tc in processed_cells:
+                    continue
+                processed_cells.add(cell._tc)
                 for para in cell.paragraphs:
                     if para.text.strip():
                         para.text = redact_text(para.text)
@@ -116,6 +131,8 @@ def redact_document_stream(stream):
 
 def process_word_document(input_filename):
     """Reads a docx file, redacts text in paragraphs and tables, and modifies it in-place."""
+    replacement_map.clear()
+    redact_cache.clear()
     print(f"Opening '{input_filename}'...")
     try:
         doc = Document(input_filename)
@@ -131,10 +148,14 @@ def process_word_document(input_filename):
         if para.text.strip():
             para.text = redact_text(para.text)
 
-    # Process tables (very common in Prospectus documents)
+    # Process tables (deduplicate merged cells to optimize speed)
+    processed_cells = set()
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
+                if cell._tc in processed_cells:
+                    continue
+                processed_cells.add(cell._tc)
                 for para in cell.paragraphs:
                     if para.text.strip():
                         para.text = redact_text(para.text)
