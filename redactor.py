@@ -1,3 +1,4 @@
+import io
 import re
 import spacy
 from faker import Faker
@@ -84,6 +85,33 @@ def redact_text(text):
         redacted_text = redacted_text[:ent.start_char] + fake_val + redacted_text[ent.end_char:]
 
     return redacted_text
+
+def redact_document_stream(stream):
+    """Reads a docx stream, redacts it in memory, and returns a BytesIO stream with the redacted document."""
+    try:
+        doc = Document(stream)
+    except Exception as e:
+        print(f"Error: Could not open document stream. Exact error: {e}")
+        return None
+
+    # Process standard paragraphs
+    for para in doc.paragraphs:
+        if para.text.strip():
+            para.text = redact_text(para.text)
+
+    # Process tables (very common in Prospectus documents)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    if para.text.strip():
+                        para.text = redact_text(para.text)
+
+    # Save modified document to a memory stream
+    output_stream = io.BytesIO()
+    doc.save(output_stream)
+    output_stream.seek(0)
+    return output_stream
 
 def process_word_document(input_filename):
     """Reads a docx file, redacts text in paragraphs and tables, and modifies it in-place."""

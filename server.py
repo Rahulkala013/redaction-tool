@@ -5,11 +5,12 @@ Run this with: python3 server.py
 Then open http://localhost:5000 in your browser.
 """
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, send_file
 import os
 import sys
+import io
 from pathlib import Path
-from redactor import process_word_document
+from redactor import redact_document_stream
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
@@ -48,22 +49,19 @@ def redact():
         if not file.filename.endswith('.docx'):
             return "Only .docx files are supported", 400
         
-        # Save uploaded file
-        filename = file.filename
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        # Read the file directly into a memory stream
+        input_stream = io.BytesIO(file.read())
         
-        # If file exists, create a backup or overwrite
-        file.save(filepath)
+        # Process the document stream (entirely in memory)
+        output_stream = redact_document_stream(input_stream)
         
-        # Process the document (modifies in-place)
-        success = process_word_document(filepath)
-        
-        if success:
-            return jsonify({
-                'status': 'success',
-                'message': f'Document redacted successfully',
-                'file': filename
-            }), 200
+        if output_stream:
+            return send_file(
+                output_stream,
+                as_attachment=True,
+                download_name=f"redacted_{file.filename}",
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
         else:
             return "Error processing document", 500
             
