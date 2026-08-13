@@ -75,12 +75,14 @@ def health():
     return jsonify({'status': 'ok'}), 200
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    
     print("=" * 50)
     print("PII Redactor Server")
     print("=" * 50)
-    print(f"Server running at: http://localhost:5000")
-    print(f"Upload folder: {os.path.abspath(app.config['UPLOAD_FOLDER'])}")
+    print(f"Server running at: http://0.0.0.0:{port}")
     print("\nPress CTRL+C to stop the server")
     print("=" * 50)
     
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    app.run(debug=debug_mode, host='0.0.0.0', port=port)
