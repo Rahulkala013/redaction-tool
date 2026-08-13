@@ -1,0 +1,4 @@
+python-docx==0.8.11
+spacy==3.7.2
+faker==22.6.0
+flask==3.0.0
