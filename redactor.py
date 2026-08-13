@@ -60,58 +60,25 @@ def get_fake_value(entity_text, entity_type):
     replacement_map[entity_text] = fake_val
     return fake_val
 
-def redact_text(text):
-    """Processes text to detect and replace PII with fake data."""
-    if not text.strip():
-        return text
-    if text in redact_cache:
-        return redact_cache[text]
-
+def redact_text_regex(text):
+    """Applies regex-based redaction patterns to a string."""
     redacted_text = text
-
-    # 1. Regex-based Redaction
     for label, pattern in PATTERNS.items():
         matches = re.finditer(pattern, redacted_text)
         for match in reversed(list(matches)):
             original = match.group(0)
-            # Check for non-PII operational numbers
             if "Order" in text[max(0, match.start()-10):match.start()] or "Ticket" in text[max(0, match.start()-10):match.start()]:
                 continue
-                
             fake_val = get_fake_value(original, label)
             redacted_text = redacted_text[:match.start()] + fake_val + redacted_text[match.end():]
-
-    # 2. NER-based Redaction
-    # Skip running heavy spaCy NER if the text doesn't contain any letters (names/orgs require alphabetic characters)
-    if re.search(r'[a-zA-Z]', redacted_text):
-        doc = nlp(redacted_text, disable=["tagger", "parser", "attribute_ruler", "lemmatizer"])
-        # NOTE: Using doc.ents here to fix the previous token issue!
-        pii_entities = [ent for ent in doc.ents if ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]]
-        pii_entities = sorted(pii_entities, key=lambda x: x.start_char, reverse=True)
-        
-        for ent in pii_entities:
-            fake_val = get_fake_value(ent.text, ent.label_)
-            redacted_text = redacted_text[:ent.start_char] + fake_val + redacted_text[ent.end_char:]
-
-    redact_cache[text] = redacted_text
     return redacted_text
 
-def redact_document_stream(stream):
-    """Reads a docx stream, redacts it in memory, and returns a BytesIO stream with the redacted document."""
+def redact_docx_document(doc):
+    """Processes all paragraphs and table cells in a Document object in fast batches."""
     replacement_map.clear()
-    redact_cache.clear()
-    try:
-        doc = Document(stream)
-    except Exception as e:
-        print(f"Error: Could not open document stream. Exact error: {e}")
-        return None
-
-    # Process standard paragraphs
-    for para in doc.paragraphs:
-        if para.text.strip():
-            para.text = redact_text(para.text)
-
-    # Process tables (deduplicate merged cells to optimize speed)
+    
+    # Collect all paragraph objects from document body and tables
+    all_paras = list(doc.paragraphs)
     processed_cells = set()
     for table in doc.tables:
         for row in table.rows:
@@ -119,11 +86,59 @@ def redact_document_stream(stream):
                 if cell._tc in processed_cells:
                     continue
                 processed_cells.add(cell._tc)
-                for para in cell.paragraphs:
-                    if para.text.strip():
-                        para.text = redact_text(para.text)
+                all_paras.extend(cell.paragraphs)
 
-    # Save modified document to a memory stream
+    # Step 1: Regex redaction & collect unique texts needing NER
+    para_regex_map = {}
+    texts_for_ner = set()
+
+    for para in all_paras:
+        txt = para.text
+        if not txt.strip():
+            continue
+        if txt not in para_regex_map:
+            reg_txt = redact_text_regex(txt)
+            para_regex_map[txt] = reg_txt
+            if re.search(r'[a-zA-Z]', reg_txt):
+                texts_for_ner.add(reg_txt)
+
+    # Step 2: Batch NER with C-compiled nlp.pipe
+    unique_ner_texts = list(texts_for_ner)
+    ner_results = {}
+    
+    if unique_ner_texts:
+        docs = nlp.pipe(unique_ner_texts, batch_size=128, disable=["tagger", "parser", "attribute_ruler", "lemmatizer"])
+        for orig_text, spacy_doc in zip(unique_ner_texts, docs):
+            pii_entities = [ent for ent in spacy_doc.ents if ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]]
+            pii_entities = sorted(pii_entities, key=lambda x: x.start_char, reverse=True)
+            
+            redacted_text = orig_text
+            for ent in pii_entities:
+                fake_val = get_fake_value(ent.text, ent.label_)
+                redacted_text = redacted_text[:ent.start_char] + fake_val + redacted_text[ent.end_char:]
+            ner_results[orig_text] = redacted_text
+
+    # Step 3: Apply final redacted texts back to paragraphs
+    final_cache = {}
+    for para in all_paras:
+        txt = para.text
+        if not txt.strip():
+            continue
+        if txt not in final_cache:
+            reg_txt = para_regex_map[txt]
+            final_cache[txt] = ner_results.get(reg_txt, reg_txt)
+        para.text = final_cache[txt]
+
+def redact_document_stream(stream):
+    """Reads a docx stream, redacts it in memory, and returns a BytesIO stream with the redacted document."""
+    try:
+        doc = Document(stream)
+    except Exception as e:
+        print(f"Error: Could not open document stream. Exact error: {e}")
+        return None
+
+    redact_docx_document(doc)
+
     output_stream = io.BytesIO()
     doc.save(output_stream)
     output_stream.seek(0)
@@ -131,8 +146,6 @@ def redact_document_stream(stream):
 
 def process_word_document(input_filename):
     """Reads a docx file, redacts text in paragraphs and tables, and modifies it in-place."""
-    replacement_map.clear()
-    redact_cache.clear()
     print(f"Opening '{input_filename}'...")
     try:
         doc = Document(input_filename)
@@ -142,25 +155,8 @@ def process_word_document(input_filename):
         return False
 
     print("Scrubbing document for PII (this might take a moment for large files)...")
-    
-    # Process standard paragraphs
-    for para in doc.paragraphs:
-        if para.text.strip():
-            para.text = redact_text(para.text)
+    redact_docx_document(doc)
 
-    # Process tables (deduplicate merged cells to optimize speed)
-    processed_cells = set()
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell._tc in processed_cells:
-                    continue
-                processed_cells.add(cell._tc)
-                for para in cell.paragraphs:
-                    if para.text.strip():
-                        para.text = redact_text(para.text)
-
-    # Save the modified document back to the same file
     doc.save(input_filename)
     print(f"Success! Document redacted and saved as '{input_filename}'")
     return True
